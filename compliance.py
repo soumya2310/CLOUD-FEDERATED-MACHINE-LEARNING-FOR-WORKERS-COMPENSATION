@@ -1,124 +1,132 @@
-"""Treatment-compliance domain.
+"""Treatment-compliance domain: reconstruction-based anomaly detection.
 
-PRISM: a feed-forward autoencoder trained only on guideline-consistent sequences;
-the anomaly score is reconstruction error augmented with a guideline-regularization
-term (weight gamma) that penalizes reconstructed treatment intensity exceeding the
-ODG envelope. Baseline: Isolation Forest. Reports F1, ROC-AUC, precision/recall,
-and expected calibration error, plus the gamma sensitivity sweep (Fig. 4a) and the
-data behind the ROC (Fig. 4b), reliability diagram and score histograms (Fig. 6).
+A feed-forward autoencoder (reference implementation of the sequence
+autoencoder; swap in a torch LSTM-AE for the deep variant) is trained on
+compliant sequences only. Anomaly score = reconstruction error, optionally
+augmented by a guideline-regularization penalty that flags care exceeding the
+ODG intensity envelope. Reports REAL F1 / precision / recall / ROC-AUC / ECE
+and a real ablation of the guideline term. Baseline = Isolation Forest.
 """
 import numpy as np
 from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import IsolationForest
-from sklearn.isotonic import IsotonicRegression
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score, precision_recall_fscore_support, roc_curve
-from . import config as C
+from sklearn.linear_model import LogisticRegression
+
+from .metrics import f1_prec_rec, auc, expected_calibration_error
 
 
-def _summary_features(Xseq):
-    """Per-channel mean/std only. The Isolation Forest sees these marginal
-    statistics but not the temporal structure of a sequence, which is the
-    reconstruction autoencoder's advantage (Section III-B of the paper)."""
-    return np.concatenate([Xseq.mean(axis=1), Xseq.std(axis=1)], axis=1)
+def _flatten(X):
+    return X.reshape(X.shape[0], -1)
 
 
-def _guideline_penalty(Xseq):
-    """max(0, peak treatment intensity - ODG envelope)^2 per sequence."""
-    intensity = Xseq[:, :, 0].max(axis=1)           # channel 0 = treatment intensity
-    return np.clip(intensity - C.ODG_ENVELOPE, 0, None) ** 2
+def _guideline_penalty(X, envelope):
+    """Per-sequence excess of treatment intensity over the ODG envelope."""
+    intensity = X[:, :, 0]                      # channel 0
+    excess = np.clip(intensity - envelope[None, :], 0, None)
+    return excess.mean(axis=1)                  # (n,)
 
 
-def _expected_calibration_error(y, p, bins=10):
-    edges = np.quantile(p, np.linspace(0, 1, bins + 1))
-    edges[0], edges[-1] = -1e9, 1e9
-    ece = 0.0
-    for i in range(bins):
-        m = (p >= edges[i]) & (p < edges[i + 1])
-        if m.sum() == 0:
-            continue
-        ece += m.mean() * abs(y[m].mean() - p[m].mean())
-    return float(ece)
+def evaluate_compliance(X, y, envelope, gamma=0.15, seed=0,
+                        thr_pct=95.0, folds=5):
+    """Cross-validated compliance detection. Returns fold metrics for the
+    guideline-regularized AE, the ablated AE (gamma=0), and IsolationForest.
+    """
+    rng = np.random.default_rng(seed)
+    n = len(X)
+    Xf = _flatten(X)
+    pen = _guideline_penalty(X, envelope)
+    idx = np.arange(n); rng.shuffle(idx)
+    fold_id = np.array_split(idx, folds)
+
+    out = {k: [] for k in ["f1", "prec", "rec", "auc", "ece",
+                           "f1_abl", "auc_abl", "f1_if", "auc_if"]}
+    for f in range(folds):
+        te = fold_id[f]
+        tr = np.concatenate([fold_id[g] for g in range(folds) if g != f])
+        # split train into fit (compliant only) + validation (for threshold)
+        tr_comp = tr[y[tr] == 0]
+        n_val = int(0.25 * len(tr_comp))
+        val = tr_comp[:n_val]; fit = tr_comp[n_val:]
+
+        sc = StandardScaler().fit(Xf[fit])
+        Zfit, Zval, Zte = sc.transform(Xf[fit]), sc.transform(Xf[val]), sc.transform(Xf[te])
+
+        ae = MLPRegressor(hidden_layer_sizes=(64, 24, 64), activation="relu",
+                          alpha=1e-4, max_iter=120, random_state=seed + f)
+        ae.fit(Zfit, Zfit)
+
+        def recon_err(Z):
+            return ((ae.predict(Z) - Z) ** 2).mean(axis=1)
+
+        err_val = recon_err(Zval)
+        err_te = recon_err(Zte)
+
+        # guideline-regularized score vs ablated score
+        score_te = err_te + gamma * pen[te]
+        score_val = err_val + gamma * pen[val]
+        score_abl = err_te
+
+        thr = np.percentile(score_val, thr_pct)
+        pred = (score_te > thr).astype(int)
+        f1, pr, rc = f1_prec_rec(y[te], pred)
+        out["f1"].append(f1); out["prec"].append(pr); out["rec"].append(rc)
+        out["auc"].append(auc(y[te], score_te))
+
+        # calibrated probability -> ECE (Platt scaling on validation scores)
+        yval = y[val]
+        # validation has only compliant; build calibration set from tr instead
+        tr_scores = recon_err(sc.transform(Xf[tr])) + gamma * pen[tr]
+        lr = LogisticRegression(max_iter=200).fit(tr_scores.reshape(-1, 1), y[tr])
+        p_te = lr.predict_proba(score_te.reshape(-1, 1))[:, 1]
+        out["ece"].append(expected_calibration_error(y[te], p_te))
+
+        # ablation gamma=0
+        thr_a = np.percentile(err_val, thr_pct)
+        pred_a = (score_abl > thr_a).astype(int)
+        f1a, _, _ = f1_prec_rec(y[te], pred_a)
+        out["f1_abl"].append(f1a); out["auc_abl"].append(auc(y[te], score_abl))
+
+        # Isolation Forest baseline
+        iso = IsolationForest(n_estimators=200, random_state=seed + f).fit(Zfit)
+        s_if = -iso.score_samples(Zte)
+        s_if_val = -iso.score_samples(Zval)
+        thr_if = np.percentile(s_if_val, thr_pct)
+        pred_if = (s_if > thr_if).astype(int)
+        f1if, _, _ = f1_prec_rec(y[te], pred_if)
+        out["f1_if"].append(f1if); out["auc_if"].append(auc(y[te], s_if))
+
+    res = {k: np.array(v) for k, v in out.items()}
+    res["point"] = {k: float(np.mean(v)) for k, v in res.items()}
+    return res
 
 
-def run(cohort, seed=C.MASTER_SEED):
-    X, y = cohort["X"], cohort["y"]
-    n, T, D = X.shape
-    Xf = X.reshape(n, T * D)
-    Xs = _summary_features(X)
-    pen = _guideline_penalty(X)
-
-    (Xtr, Xte, Xstr, Xste, ytr, yte, ptr, pte) = train_test_split(
-        Xf, Xs, y, pen, test_size=0.35, random_state=seed, stratify=y)
-
-    comp = ytr == 0
-    # standardize reconstruction targets (helps the AE separate cleanly)
-    mu, sd = Xtr[comp].mean(0), Xtr[comp].std(0) + 1e-6
-    Ztr, Zte = (Xtr - mu) / sd, (Xte - mu) / sd
-
-    ae = MLPRegressor(hidden_layer_sizes=(C.AE_HIDDEN, C.AE_LATENT, C.AE_HIDDEN),
-                      activation="relu", solver="adam", alpha=1e-4,
-                      max_iter=200, random_state=seed)
-    ae.fit(Ztr[comp], Ztr[comp])
-
-    def recon_error(Z):
-        e = (ae.predict(Z) - Z) ** 2
-        # blend mean error with the worst-reconstructed window (localized deviations)
-        return 0.92 * e.mean(axis=1) + 0.08 * e.reshape(len(Z), C.SEQ_LEN, C.SEQ_DIM).max(axis=(1, 2))
-    recon = recon_error(Zte); recon_tr = recon_error(Ztr)
-
-    # normalize base score and penalty; gamma term is a small guideline nudge
-    r_lo, r_hi = np.percentile(recon, 1), np.percentile(recon, 99)
-    rn = (recon - r_lo) / (r_hi - r_lo)
-    rn_tr = (recon_tr - r_lo) / (r_hi - r_lo)
-    pscale = np.percentile(pen, 99) + 1e-9
-    pn = 0.40 * pte / pscale
-    pn_tr = 0.40 * ptr / pscale
-
-    def f1_pr_rc(sc, thr=None):
-        if thr is None:
-            thr = np.percentile(sc[yte == 0], C.THRESHOLD_PCTL)
-        pred = (sc > thr).astype(int)
-        pr, rc, f1, _ = precision_recall_fscore_support(
-            yte, pred, average="binary", zero_division=0)
-        return float(f1), float(pr), float(rc), float(thr)
-
-    # ---- gamma sweep (Fig. 4a): small monotone gain from the guideline prior ----
-    gamma_f1 = [round(f1_pr_rc(rn + g * pn)[0], 4) for g in C.GAMMA_SWEEP]
-
-    # ---- deployed model at gamma = GUIDELINE_WEIGHT ----
-    sc_te = rn + C.GUIDELINE_WEIGHT * pn
-    sc_tr = rn_tr + C.GUIDELINE_WEIGHT * pn_tr
-    f1_ae, pr_ae, rc_ae, thr = f1_pr_rc(sc_te)
-    auc_ae = roc_auc_score(yte, sc_te)
-    fpr, tpr, _ = roc_curve(yte, sc_te)
-    op_fpr = float((sc_te[yte == 0] > thr).mean())
-    op_tpr = float((sc_te[yte == 1] > thr).mean())
-
-    # ---- Isolation Forest baseline (on compact summary features) ----
-    iso = IsolationForest(n_estimators=250, contamination=0.15, random_state=seed)
-    iso.fit(Xstr[comp])
-    iso_score = -iso.score_samples(Xste)
-    f1_iso, pr_i, rc_i, _ = f1_pr_rc(iso_score)
-    auc_iso = roc_auc_score(yte, iso_score)
-
-    # ---- calibration: isotonic-scaled score (Fig. 6a) ----
-    iso_cal = IsotonicRegression(out_of_bounds="clip")
-    iso_cal.fit(sc_tr, ytr)
-    p_cal = iso_cal.predict(sc_te)
-    ece = _expected_calibration_error(yte, p_cal, bins=10)
-
-    return dict(
-        f1_baseline=round(float(f1_iso), 3), f1_prism=round(float(f1_ae), 3),
-        f1_gain=round(float(f1_ae - f1_iso), 3),
-        auc_baseline=round(float(auc_iso), 3), auc_prism=round(float(auc_ae), 3),
-        precision=round(float(pr_ae), 3), recall=round(float(rc_ae), 3),
-        ece=round(float(ece), 3),
-        gamma_sweep=C.GAMMA_SWEEP, gamma_f1=gamma_f1,
-        # figure data
-        roc_fpr=fpr.tolist(), roc_tpr=tpr.tolist(),
-        op_fpr=op_fpr, op_tpr=op_tpr,
-        cal_p=p_cal, cal_y=yte,
-        score_compliant=sc_te[yte == 0], score_noncompliant=sc_te[yte == 1],
-        threshold=float(thr),
-    )
+def compliance_normality_for_claims(df, cfg, seed=0):
+    """Generate one short treatment sequence per prognosis claim (parameterized
+    by its covariates), train an AE on the 'normal' majority, and return a
+    per-claim normality score in [0,1] for cross-domain fusion (H)."""
+    rng = np.random.default_rng(seed + 7)
+    n = len(df); T = cfg.seq_len
+    envelope = 1.0 - 0.6 * (np.arange(T) / T)
+    sev = df["severity"].to_numpy(); psy = df["psychosocial"].to_numpy()
+    atty = df["attorney"].to_numpy()
+    X = np.zeros((n, T, 4))
+    for i in range(n):
+        base = envelope * rng.uniform(0.7, 1.0) + rng.normal(0, 0.05, T)
+        # higher severity/psychosocial/attorney -> more guideline drift
+        drift = 0.4 * sev[i] + 0.3 * psy[i] + 0.2 * atty[i]
+        if rng.random() < drift * 0.5:
+            s = rng.integers(0, T - 4); base[s:] += rng.uniform(0.3, 0.8)
+        X[i] = np.column_stack([np.clip(base, 0, None),
+                                np.clip(base * rng.uniform(0.8, 1.2, T), 0, None),
+                                np.clip(envelope + rng.normal(0, 0.06, T), 0, None),
+                                np.clip(rng.normal(0.15, 0.05, T), 0, 1)])
+    Xf = X.reshape(n, -1)
+    pen = _guideline_penalty(X, envelope)
+    sc = StandardScaler().fit(Xf)
+    Z = sc.transform(Xf)
+    ae = MLPRegressor(hidden_layer_sizes=(64, 24, 64), max_iter=80,
+                      random_state=seed).fit(Z, Z)
+    err = ((ae.predict(Z) - Z) ** 2).mean(1) + 0.15 * pen
+    normality = 1.0 - (err - err.min()) / (np.ptp(err) + 1e-9)
+    return normality

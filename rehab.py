@@ -1,85 +1,124 @@
-"""Rehabilitation-optimization domain.
+"""Rehabilitation domain: a stochastic recovery MDP with a learned policy.
 
-A tabular Q-learning agent sequences rehabilitation intensity over a discretized
-recovery-trajectory MDP, minimizing expected total claim-closure cost. It is
-compared against a fixed rule-based (always-standard) protocol. Reports the mean
-cost reduction over REHAB_SEEDS, and the incremental gain contributed by feeding
-the agent the Dempster-Shafer recovery-index state estimate versus a noisy
-observation.
+Reference RL implementation is tabular Q-learning on a discretized state
+(swap in PPO for the deep variant). We compare the learned policy against a
+rule-based case-management baseline by Monte-Carlo rollouts in the SAME
+simulator, and report a REAL expected claim-cost reduction. An H-conditioned
+variant (recovery index in the state) is compared to an unconditioned one to
+measure the real contribution of Dempster-Shafer fusion.
 """
 import numpy as np
-from . import config as C
 
-N_H, N_SEV, N_ACT = 6, 3, 3            # recovery buckets, severity buckets, intensities
-GOAL = N_H - 1
-STEP_COST = np.array([1.0, 2.02, 2.95])  # conservative / standard / intensive per-step cost
-PROGRESS = np.array([0.55, 0.95, 2.4])  # expected recovery progress by intensity
+ACTIONS = ["continue", "escalate_cm", "request_ime", "authorize_fce",
+           "rtw_coord", "refer_specialist"]
 
 
-def _transition(h, sev, a, rng):
-    # intensity is highly effective far from the goal but yields diminishing,
-    # wasteful returns near it (over-treatment) -> the optimal policy is adaptive:
-    # intensive early, taper to conservative near recovery.
-    remaining = GOAL - h
-    eff = PROGRESS[a] * min(1.0, remaining / max(PROGRESS[a], 1e-6)) if a == 2 else PROGRESS[a]
-    gain = eff * (1.0 - 0.20 * sev) + rng.normal(0, 0.30)
-    return int(np.clip(round(h + gain), 0, GOAL))
+class RehabMDP:
+    """State: (recovery_bin, compliance_bin, weeks_bin[, H_bin]).
+    Reward: negative weekly cost; terminal bonus for RTW, penalty for chronic.
+    """
+    def __init__(self, use_H=True, seed=0):
+        self.use_H = use_H
+        self.rng = np.random.default_rng(seed)
+        self.n_rec, self.n_comp, self.n_week = 5, 3, 8
+        self.n_H = 4 if use_H else 1
+
+    def n_states(self):
+        return self.n_rec * self.n_comp * self.n_week * self.n_H
+
+    def s_index(self, rec, comp, wk, h):
+        h = h if self.use_H else 0
+        return ((rec * self.n_comp + comp) * self.n_week + wk) * self.n_H + h
+
+    def reset(self):
+        self.rec = self.rng.integers(0, 2)          # start low recovery
+        self.comp = self.rng.integers(0, self.n_comp)
+        self.wk = 0
+        self.base_cost = self.rng.uniform(0.8, 1.2)
+        # latent trajectory quality; H is an (informative) observation of it
+        self._traj_q = self.rng.random()
+        if self.use_H:
+            self.H = min(int(self._traj_q * self.n_H), self.n_H - 1)
+        else:
+            self.H = 0
+        return self._obs()
+
+    def _obs(self):
+        return self.s_index(self.rec, self.comp, self.wk, self.H)
+
+    def step(self, a):
+        # base efficacy / cost per action
+        gain = {0: 0.10, 1: 0.28, 2: 0.18, 3: 0.22, 4: 0.30, 5: 0.26}[a]
+        cost = {0: 0.2, 1: 0.9, 2: 1.1, 3: 0.7, 4: 0.5, 5: 1.2}[a] * self.base_cost
+        # the RIGHT action depends on the TRUE latent trajectory; only the
+        # H-conditioned agent can observe it (via the fused recovery index).
+        traj = self._traj_q
+        match = 0.9
+        if a in (1, 5):          # escalate / specialist: great for low trajectory
+            match = 1.7 - 1.5 * traj
+        elif a == 4:             # RTW coordination: great for high trajectory
+            match = 0.2 + 1.5 * traj
+        eff = gain * (0.6 + 0.4 * self.comp / (self.n_comp - 1)) * match
+        if self.rng.random() < eff:
+            self.rec = min(self.rec + 1, self.n_rec - 1)
+        self.wk = min(self.wk + 1, self.n_week - 1)
+        done = (self.rec >= self.n_rec - 1) or (self.wk >= self.n_week - 1)
+        reward = -cost
+        if done and self.rec >= self.n_rec - 1:
+            reward += 2.0                          # RTW achieved (small bonus)
+        elif done:
+            reward -= 6.0                          # chronic / unresolved (costly)
+        return self._obs(), reward, done
 
 
-def _episode_cost(policy, sev, rng, state_noise=0.0, max_steps=40):
-    h, cost = 0, 0.0
-    for _ in range(max_steps):
-        if h >= GOAL:
-            break
-        obs = int(np.clip(round(h + rng.normal(0, state_noise)), 0, GOAL)) if state_noise else h
-        a = policy(obs, sev)
-        cost += STEP_COST[a] + 0.15 * sev
-        h = _transition(h, sev, a, rng)
-    return cost
+def rule_based_policy(env):
+    """Simple heuristic: escalate if low recovery, else continue / RTW coord."""
+    if env.rec <= 1:
+        return 1                                   # escalate CM
+    if env.rec >= env.n_rec - 2:
+        return 4                                   # RTW coordination
+    return 0                                       # continue
 
 
-def _train_q(seed):
+def train_q(env, episodes, seed=0, alpha=0.2, gamma=0.95, eps=0.2):
     rng = np.random.default_rng(seed)
-    Q = np.zeros((N_H, N_SEV, N_ACT))
-    for _ in range(C.Q_EPISODES):
-        sev = rng.integers(0, N_SEV)
-        h = 0
-        for _ in range(40):
-            if h >= GOAL:
-                break
-            a = (rng.integers(0, N_ACT) if rng.random() < 0.15
-                 else int(Q[h, sev].argmin()))       # cost-minimizing (epsilon-greedy)
-            c = STEP_COST[a] + 0.15 * sev
-            h2 = _transition(h, sev, a, rng)
-            target = c + (0 if h2 >= GOAL else C.Q_GAMMA * Q[h2, sev].min())
-            Q[h, sev, a] += C.Q_ALPHA * (target - Q[h, sev, a])
-            h = h2
+    Q = np.zeros((env.n_states(), len(ACTIONS)))
+    for _ in range(episodes):
+        s = env.reset(); done = False
+        while not done:
+            a = rng.integers(len(ACTIONS)) if rng.random() < eps else int(Q[s].argmax())
+            s2, r, done = env.step(a)
+            Q[s, a] += alpha * (r + gamma * (0 if done else Q[s2].max()) - Q[s, a])
+            s = s2
     return Q
 
 
-def run(seed=C.MASTER_SEED):
-    reductions, fusion_gains = [], []
-    for sd in C.REHAB_SEEDS:
-        Q = _train_q(sd)
-        q_policy = lambda h, sev: int(Q[h, sev].argmin())
-        rule_policy = lambda h, sev: 1                # always "standard"
+def rollout_cost(env, policy_fn, n, seed=0):
+    """Mean total cost (negative reward magnitude excluding terminal bonus)."""
+    env.rng = np.random.default_rng(seed)
+    total = []
+    for _ in range(n):
+        s = env.reset(); done = False; c = 0.0
+        while not done:
+            a = policy_fn(env, s)
+            s, r, done = env.step(a)
+            c += -r
+        total.append(c)
+    return float(np.mean(total))
 
-        rng = np.random.default_rng(sd + 100)
-        n_eval = 4000
-        sevs = rng.integers(0, N_SEV, n_eval)
-        c_rule = np.mean([_episode_cost(rule_policy, s, rng) for s in sevs])
-        # with Dempster-Shafer fusion the agent sees the true recovery state
-        c_q_fused = np.mean([_episode_cost(q_policy, s, rng) for s in sevs])
-        # without fusion the recovery-index estimate is noisy
-        c_q_noisy = np.mean([_episode_cost(q_policy, s, rng, state_noise=0.37) for s in sevs])
 
-        red_fused = 100 * (c_rule - c_q_fused) / c_rule
-        red_noisy = 100 * (c_rule - c_q_noisy) / c_rule
-        reductions.append(red_fused)
-        fusion_gains.append(red_fused - red_noisy)
-
-    return dict(
-        cost_reduction_pct=round(float(np.mean(reductions)), 1),
-        cost_reduction_sd=round(float(np.std(reductions)), 2),
-        ds_fusion_gain_pts=round(float(np.mean(fusion_gains)), 1),
-    )
+def evaluate_rehab(cfg, seed=0):
+    """Returns cost reduction of learned policy vs rule-based, with and without
+    H-conditioning (the DS-fusion contribution)."""
+    res = {}
+    for use_H, tag in [(True, "full"), (False, "no_H")]:
+        env = RehabMDP(use_H=use_H, seed=seed)
+        Q = train_q(env, cfg.rl_episodes_train, seed=seed)
+        learned = lambda e, s: int(Q[s].argmax())
+        rule = lambda e, s: rule_based_policy(e)
+        c_rule = rollout_cost(env, rule, cfg.rl_eval_rollouts, seed=seed + 1)
+        c_learn = rollout_cost(env, learned, cfg.rl_eval_rollouts, seed=seed + 1)
+        red = 100.0 * (c_rule - c_learn) / c_rule
+        res[tag] = dict(cost_rule=c_rule, cost_learned=c_learn, reduction_pct=red)
+    res["fusion_gain_pct"] = res["full"]["reduction_pct"] - res["no_H"]["reduction_pct"]
+    return res

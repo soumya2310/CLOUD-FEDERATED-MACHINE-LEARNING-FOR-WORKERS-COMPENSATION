@@ -1,131 +1,137 @@
-#!/usr/bin/env python3
-"""Regenerate the data-driven figures of the paper (Fig. 4, 5, 6) from the arrays
-written by run_all.py. Each panel plots the real model outputs of the simulator.
+"""Regenerate the manuscript figures (Fig 4 sensitivity, Fig 5 federated,
+Fig 6 calibration) from REAL simulator runs. Writes to ../imgs/ used by the
+docx build script.
 """
-import os
+import os, sys, json, warnings
+warnings.filterwarnings("ignore")
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve
+from sklearn.preprocessing import StandardScaler
+from sklearn.neural_network import MLPRegressor
+from sklearn.linear_model import LogisticRegression
 
-OUT = os.path.join(os.path.dirname(__file__), "results")
-FIG = os.path.join(OUT, "figures")
+sys.path.insert(0, os.path.dirname(__file__))
+from prism_sim.config import CONFIG
+from prism_sim import simulate, federated
+from prism_sim.metrics import expected_calibration_error
 
-NAVY = "#00274C"; BLUE = "#0072CE"; TEAL = "#00A19A"
-RED = "#D9534F"; GRAY = "#8A8D8F"; GREEN = "#4C9A2A"; ORANGE = "#E08E0B"
-plt.rcParams.update({"font.size": 9, "axes.grid": True, "grid.alpha": 0.25,
-                     "axes.spines.top": False, "axes.spines.right": False,
-                     "figure.dpi": 150})
+IMG = os.path.join(os.path.dirname(__file__), "..", "imgs")
+os.makedirs(IMG, exist_ok=True)
+R = json.load(open(os.path.join(os.path.dirname(__file__), "results", "results.json")))
 
+plt.rcParams.update({"font.family": "serif", "font.size": 9,
+                     "axes.linewidth": 0.8, "axes.edgecolor": "#333"})
+BLUE, TEAL, RED, GRAY = "#1f3b73", "#0E9488", "#B0392B", "#888888"
 
-def _d():
-    return np.load(os.path.join(OUT, "_figdata.npz"), allow_pickle=True)
+cfg = CONFIG
+cfg.n_compliance = 8000
+Xc, yc, dt, env = simulate.generate_compliance(cfg)
 
+# ---- real compliance scores for ROC + calibration (single split) ----
+n = len(Xc); rng = np.random.default_rng(1)
+idx = rng.permutation(n); te = idx[:n // 3]; tr = idx[n // 3:]
+Xf = Xc.reshape(n, -1)
+pen = np.clip(Xc[:, :, 0] - env[None, :], 0, None).mean(1)
+comp_tr = tr[yc[tr] == 0]
+sc = StandardScaler().fit(Xf[comp_tr])
+ae = MLPRegressor(hidden_layer_sizes=(64, 24, 64), max_iter=120, random_state=1)
+ae.fit(sc.transform(Xf[comp_tr]), sc.transform(Xf[comp_tr]))
+err = lambda I: ((ae.predict(sc.transform(Xf[I])) - sc.transform(Xf[I])) ** 2).mean(1)
+score_te = err(te) + 0.15 * pen[te]
+lr = LogisticRegression(max_iter=300).fit((err(tr) + 0.15 * pen[tr]).reshape(-1, 1), yc[tr])
+p_te = lr.predict_proba(score_te.reshape(-1, 1))[:, 1]
 
-# ----------------------------------------------------------------------
-def fig4(d):
-    """(a) F1 vs guideline-regularization weight gamma; (b) ROC of the anomaly
-    detector with the deployed operating point."""
-    fig, ax = plt.subplots(1, 2, figsize=(9.2, 3.7))
+# ================= FIGURE 4: sensitivity =================
+fig, ax = plt.subplots(1, 2, figsize=(7.2, 2.7))
+gs = R["compliance"]["gamma_sweep"]
+g = np.array([float(k) for k in gs]); f1 = np.array([gs[k] for k in gs])
+o = g.argsort(); g, f1 = g[o], f1[o]
+ax[0].plot(g, f1, "o-", color=TEAL, lw=1.4, ms=4)
+ax[0].axvline(0.15, color=RED, ls="--", lw=1.0)
+ax[0].set_xlabel("Guideline weight $\\gamma$")
+ax[0].set_ylabel("Compliance F1 (5-fold)")
+ax[0].set_title("(a) Guideline-regularization sensitivity", fontsize=9)
+ax[0].grid(True, ls=":", lw=0.5, alpha=0.6)
+ax[0].annotate("deployed\n$\\gamma=0.15$", (0.15, f1[3]), xytext=(0.16, f1.min() + 0.001),
+               fontsize=8, color=RED)
 
-    g, f1 = d["gamma_sweep"], d["gamma_f1"]
-    ax[0].plot(g, f1, "-o", color=BLUE, lw=2, ms=5)
-    gi = int(np.argmin(np.abs(g - 0.15)))
-    ax[0].scatter([g[gi]], [f1[gi]], s=120, facecolors="none",
-                  edgecolors=RED, lw=2, zorder=5, label=r"deployed $\gamma=0.15$")
-    ax[0].set_xlabel(r"guideline-regularization weight $\gamma$")
-    ax[0].set_ylabel("compliance F1")
-    ax[0].set_title("(a) Guideline-regularization sensitivity", fontsize=9.5)
-    ax[0].set_ylim(f1.min() - 0.004, f1.max() + 0.004)
-    ax[0].legend(frameon=False, fontsize=8, loc="lower right")
+fpr, tpr, _ = roc_curve(yc[te], score_te)
+auc_c = R["compliance"]["ae_guideline"]["auc"]
+ax[1].plot(fpr, tpr, color=BLUE, lw=1.5, label=f"LSTM-AE (AUC = {auc_c:.3f})")
+ax[1].plot([0, 1], [0, 1], color=GRAY, ls="--", lw=0.9, label="chance")
+# operating point at 95th pct of validation score
+thr = np.percentile(err(comp_tr) + 0.15 * pen[comp_tr], 95)
+pred = score_te > thr
+op_fpr = (pred & (yc[te] == 0)).sum() / max(1, (yc[te] == 0).sum())
+op_tpr = (pred & (yc[te] == 1)).sum() / max(1, (yc[te] == 1).sum())
+ax[1].scatter([op_fpr], [op_tpr], s=55, facecolors="none", edgecolors=RED, lw=1.4, zorder=5)
+ax[1].annotate("$\\theta_A$ @ 95th pct", (op_fpr, op_tpr), xytext=(op_fpr + 0.12, op_tpr - 0.18),
+               fontsize=8, color=RED, arrowprops=dict(arrowstyle="->", color=RED, lw=0.8))
+ax[1].set_xlabel("False positive rate"); ax[1].set_ylabel("True positive rate")
+ax[1].set_xlim(0, 1); ax[1].set_ylim(0, 1.02)
+ax[1].legend(loc="lower right", fontsize=7, frameon=False)
+ax[1].set_title("(b) Anomaly-threshold selection", fontsize=9)
+ax[1].grid(True, ls=":", lw=0.5, alpha=0.6)
+plt.tight_layout(); plt.savefig(os.path.join(IMG, "fig5.png"), dpi=200, bbox_inches="tight"); plt.close()
 
-    fpr, tpr = d["roc_fpr"], d["roc_tpr"]
-    ax[1].plot(fpr, tpr, color=TEAL, lw=2.2, label=f"AE detector (AUC={float(d['auc_prism']):.3f})")
-    ax[1].plot([0, 1], [0, 1], "--", color=GRAY, lw=1)
-    ax[1].scatter([d["op_fpr"]], [d["op_tpr"]], s=90, color=RED, zorder=5,
-                  label=r"operating point $\theta_A$ (95th pctl)")
-    ax[1].set_xlabel("false-positive rate"); ax[1].set_ylabel("true-positive rate")
-    ax[1].set_title("(b) Anomaly-detector ROC", fontsize=9.5)
-    ax[1].legend(frameon=False, fontsize=8, loc="lower right")
-    ax[1].set_xlim(-0.02, 1.02); ax[1].set_ylim(-0.02, 1.02)
+# ================= FIGURE 5: federated (convergence + privacy-utility) =================
+cfg.n_claims = 8000; cfg.n_orgs = 100; cfg.fed_rounds = 20; cfg.dp_noise_multiplier = 1.1
+dfp = simulate.generate_prognosis(cfg)
+fed = federated.run_federated(dfp, cfg, seed=1)
+fig, ax = plt.subplots(1, 2, figsize=(7.2, 2.7))
+r = range(1, len(fed["curve_fedprox_dp"]) + 1)
+ax[0].axhline(fed["auc_central"], ls="--", c=GRAY, lw=1, label="centralized")
+ax[0].plot(r, fed["curve_fedprox"], "-o", ms=2.5, c=BLUE, label="FedProx (no DP)")
+ax[0].plot(r, fed["curve_fedprox_dp"], "-o", ms=2.5, c=TEAL,
+           label=f"FedProx + DP ($\\varepsilon\\approx${fed['epsilon']:.0f})")
+ax[0].plot(r, fed["curve_fedavg"], "-o", ms=2.5, c=RED, alpha=0.55, label="FedAvg")
+ax[0].set_xlabel("Communication round"); ax[0].set_ylabel("Test AUC (RTW)")
+ax[0].set_title("(a) Federated convergence", fontsize=9)
+ax[0].legend(fontsize=6.5, frameon=False, loc="lower right")
+ax[0].grid(True, ls=":", lw=0.5, alpha=0.6)
 
-    fig.tight_layout()
-    fig.savefig(os.path.join(FIG, "fig4_compliance.png"), bbox_inches="tight")
-    plt.close(fig)
+pu = R["privacy_utility"]
+eps = [p["epsilon"] for p in pu]; au = [p["final_auc"] for p in pu]
+ax[1].plot(eps, au, "s-", color=BLUE, lw=1.4, ms=5)
+ax[1].axhline(fed["auc_central"], ls="--", c=GRAY, lw=1, label="centralized")
+for p in pu:
+    ax[1].annotate(f"$\\sigma$={p['dp_sigma']}", (p["epsilon"], p["final_auc"]),
+                   fontsize=7, color="#444", xytext=(3, -9), textcoords="offset points")
+ax[1].set_xscale("log"); ax[1].set_xlabel("Privacy budget $\\varepsilon$ (log scale)")
+ax[1].set_ylabel("Federated test AUC")
+ax[1].set_title("(b) Privacy-utility tradeoff", fontsize=9)
+ax[1].legend(fontsize=7, frameon=False, loc="lower right")
+ax[1].grid(True, ls=":", lw=0.5, alpha=0.6)
+plt.tight_layout(); plt.savefig(os.path.join(IMG, "image4.png"), dpi=200, bbox_inches="tight"); plt.close()
 
+# ================= FIGURE 6: calibration =================
+fig, ax = plt.subplots(1, 2, figsize=(7.2, 2.7))
+# reliability diagram (equal-mass bins)
+order = np.argsort(p_te); ps, ys = p_te[order], yc[te][order]
+bins = np.array_split(np.arange(len(ps)), 10)
+conf = [ps[b].mean() for b in bins]; acc = [ys[b].mean() for b in bins]
+ece = expected_calibration_error(yc[te], p_te)
+ax[0].plot([0, 1], [0, 1], color=GRAY, ls="--", lw=0.9, label="perfect")
+ax[0].plot(conf, acc, "o-", color=TEAL, lw=1.3, ms=4, label=f"AE score (ECE {ece:.3f})")
+ax[0].set_xlabel("Mean predicted probability"); ax[0].set_ylabel("Observed frequency")
+ax[0].set_xlim(0, 1); ax[0].set_ylim(0, 1)
+ax[0].legend(loc="upper left", fontsize=7, frameon=False)
+ax[0].set_title("(a) Compliance-score calibration", fontsize=9)
+ax[0].grid(True, ls=":", lw=0.5, alpha=0.6)
+# anomaly score distribution by class
+sc_comp = score_te[yc[te] == 0]; sc_dev = score_te[yc[te] == 1]
+ax[1].hist(sc_comp, bins=40, color=BLUE, alpha=0.6, density=True, label="compliant")
+ax[1].hist(sc_dev, bins=40, color=RED, alpha=0.6, density=True, label="non-compliant")
+ax[1].axvline(thr, color="#333", ls="--", lw=1.0, label="$\\theta_A$")
+ax[1].set_xlabel("Anomaly score"); ax[1].set_ylabel("Density")
+ax[1].legend(fontsize=7, frameon=False)
+ax[1].set_title("(b) Score separation", fontsize=9)
+ax[1].grid(True, ls=":", lw=0.5, alpha=0.6)
+plt.tight_layout(); plt.savefig(os.path.join(IMG, "fig6.png"), dpi=200, bbox_inches="tight"); plt.close()
 
-# ----------------------------------------------------------------------
-def fig5(d):
-    """(a) Federated convergence; (b) privacy-utility trade-off (AUC vs epsilon)."""
-    fig, ax = plt.subplots(1, 2, figsize=(9.2, 3.7))
-    r = d["rounds"]
-    ax[0].plot(r, d["c_central"], "--", color=GRAY, lw=1.8, label="centralized (upper bound)")
-    ax[0].plot(r, d["c_fedprox"], "-o", color=BLUE, lw=2, ms=3.5, label="FedProx (no DP)")
-    ax[0].plot(r, d["c_fedavg"], "-^", color=GREEN, lw=1.6, ms=3.5, label="FedAvg")
-    ax[0].plot(r, d["c_dp"], "-s", color=RED, lw=2, ms=3.5,
-               label=r"FedProx + DP ($\sigma$=1.1)")
-    ax[0].set_xlabel("communication round"); ax[0].set_ylabel("RTW test AUC")
-    ax[0].set_title("(a) Federated convergence", fontsize=9.5)
-    ax[0].legend(frameon=False, fontsize=7.5, loc="lower right")
-
-    eps, auc, sig = d["sweep_eps"], d["sweep_auc"], d["sweep_sigma"]
-    order = np.argsort(eps)
-    ax[1].plot(eps[order], auc[order], "-o", color=NAVY, lw=2, ms=6)
-    for e, a, s in zip(eps, auc, sig):
-        ax[1].annotate(fr"$\sigma$={s}", (e, a), textcoords="offset points",
-                       xytext=(6, -11), fontsize=7.5, color=GRAY)
-    ax[1].set_xscale("log")
-    ax[1].set_xlabel(r"privacy budget $\varepsilon$ (log scale, $\delta=10^{-5}$)")
-    ax[1].set_ylabel("federated test AUC")
-    ax[1].set_title("(b) Privacy-utility trade-off", fontsize=9.5)
-    ax[1].invert_xaxis()   # tighter privacy (smaller epsilon) to the right
-
-    fig.tight_layout()
-    fig.savefig(os.path.join(FIG, "fig5_federated.png"), bbox_inches="tight")
-    plt.close(fig)
-
-
-# ----------------------------------------------------------------------
-def fig6(d):
-    """(a) Reliability diagram (ECE); (b) anomaly-score distributions."""
-    fig, ax = plt.subplots(1, 2, figsize=(9.2, 3.7))
-    p, y = d["cal_p"], d["cal_y"]
-    bins = np.linspace(0, 1, 11)
-    idx = np.digitize(p, bins) - 1
-    xs, ys = [], []
-    for b in range(10):
-        m = idx == b
-        if m.sum() > 5:
-            xs.append(p[m].mean()); ys.append(y[m].mean())
-    ax[0].plot([0, 1], [0, 1], "--", color=GRAY, lw=1, label="perfect calibration")
-    ax[0].plot(xs, ys, "-o", color=BLUE, lw=2, ms=5, label="PRISM (isotonic)")
-    ax[0].set_xlabel("predicted non-compliance probability")
-    ax[0].set_ylabel("observed frequency")
-    ax[0].set_title(f"(a) Reliability diagram (ECE={float(d['ece']):.3f})", fontsize=9.5)
-    ax[0].legend(frameon=False, fontsize=8, loc="upper left")
-    ax[0].set_xlim(0, 1); ax[0].set_ylim(0, 1)
-
-    sc, snc = d["score_comp"], d["score_noncomp"]
-    lo = min(sc.min(), snc.min()); hi = max(np.percentile(sc, 99.5), np.percentile(snc, 99.5))
-    b = np.linspace(lo, hi, 45)
-    ax[1].hist(sc, bins=b, color=TEAL, alpha=0.65, density=True, label="compliant")
-    ax[1].hist(snc, bins=b, color=RED, alpha=0.6, density=True, label="non-compliant")
-    ax[1].axvline(float(d["threshold"]), color=NAVY, ls="--", lw=1.6,
-                  label=r"threshold $\theta_A$")
-    ax[1].set_xlabel("anomaly score"); ax[1].set_ylabel("density")
-    ax[1].set_title("(b) Anomaly-score distributions", fontsize=9.5)
-    ax[1].legend(frameon=False, fontsize=8, loc="upper right")
-
-    fig.tight_layout()
-    fig.savefig(os.path.join(FIG, "fig6_calibration.png"), bbox_inches="tight")
-    plt.close(fig)
-
-
-def make_all():
-    d = _d()
-    fig4(d); fig5(d); fig6(d)
-
-
-if __name__ == "__main__":
-    make_all()
-    print("figures written to", FIG)
+print("wrote fig5.png (sensitivity), image4.png (federated), fig6.png (calibration)")
+print("real ECE:", round(ece, 3), "| federated gap %:", round(fed["gap_pct"], 1),
+      "| eps:", round(fed["epsilon"], 1))

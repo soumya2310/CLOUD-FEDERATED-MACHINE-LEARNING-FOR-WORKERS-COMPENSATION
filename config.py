@@ -1,64 +1,65 @@
-"""Central configuration: master seed, cohort sizes, generator calibration, and
-model hyperparameters. Everything downstream is derived from MASTER_SEED so a
-given config reproduces the same results on any machine (up to BLAS/threading
-nondeterminism in XGBoost, which is bounded and does not change conclusions)."""
+"""Central configuration for the PRISM synthetic simulator.
 
-MASTER_SEED = 20260706
+All parameters are explicit and seeded so every reported number is reproducible.
+Sizes are set to run in a few minutes on a laptop; scale N_CLAIMS up for the
+full-size study reported in the paper.
+"""
+from dataclasses import dataclass, field
+from typing import List, Dict
 
-# ---- Cohort sizes (paper values) ----
-N_PROGNOSIS   = 180_000     # competing-risks claims
-N_COMPLIANCE  = 24_000      # labelled 30-event clinical sequences
-FRAC_NONCOMPLIANT = 0.15    # 3,600 non-compliant
-N_REHAB       = 8_000       # active-claim RL episodes
 
-# Set FAST=True (or env PRISM_FAST=1) for a ~1-minute smoke run on smaller cohorts.
-import os
-FAST = os.environ.get("PRISM_FAST", "0") == "1"
-if FAST:
-    N_PROGNOSIS, N_COMPLIANCE, N_REHAB = 30_000, 12_000, 4_000
+@dataclass
+class Config:
+    seed: int = 20260706
 
-# ---- Domain structure ----
-SECTORS = ["construction", "manufacturing", "healthcare", "transportation",
-           "retail", "administrative", "agriculture"]
-SECTOR_WEIGHTS = [0.17, 0.20, 0.16, 0.12, 0.18, 0.10, 0.07]
-N_JURISDICTIONS = 12
-CENSOR_WEEKS = 104          # two-year statutory review horizon
-N_FEATURES = 112            # engineered prognosis feature-vector width
+    # ----- cohort sizes (scale these up for the full study) -----
+    n_claims: int = 24000          # injury-prognosis cohort
+    n_compliance: int = 16000      # labelled treatment-compliance sequences
+    n_rehab_episodes: int = 6000   # rehabilitation MDP episodes
+    seq_len: int = 30              # weekly events per compliance sequence
 
-# ---- Compliance deviation mix (of the non-compliant fraction) ----
-DEVIATION_MIX = {"overtreatment": 0.62, "delayed_auth": 0.28, "contraindicated": 0.10}
-SEQ_LEN = 30                # events per clinical sequence
-SEQ_DIM = 22               # multivariate clinical observation dimension
+    # ----- prognosis: competing-risks structure -----
+    # three competing outcomes: 0=full-duty RTW, 1=modified-duty RTW, 2=permanent disability
+    horizon_weeks: int = 104       # administrative censoring horizon
+    brier_horizon: int = 52
+    # sector-specific baseline hazard scaling (non-IID across employers)
+    sectors: List[str] = field(default_factory=lambda: [
+        "construction", "manufacturing", "healthcare", "transportation",
+        "retail", "administrative", "agriculture"])
+    sector_weights: List[float] = field(default_factory=lambda: [
+        0.16, 0.17, 0.15, 0.13, 0.14, 0.14, 0.11])
+    n_jurisdictions: int = 12
 
-# ---- Prognosis models ----
-XGB_SURV = dict(objective="survival:cox", n_estimators=250, max_depth=4,
-                learning_rate=0.05, min_child_weight=5, subsample=0.85,
-                colsample_bytree=0.8, tree_method="hist")
+    # target marginals used ONLY to validate fidelity (Table 3 analogue)
+    target_mean_lost_days: float = 68.0
+    target_perm_disability_rate: float = 0.060
+    target_attorney_rate: float = 0.21
+    target_modified_share: float = 0.42
 
-# ---- Compliance autoencoder ----
-AE_LATENT = 24
-AE_HIDDEN = 64
-GUIDELINE_WEIGHT = 0.15     # gamma; Fig. 4a sweep is 0.0 .. 0.30
-GAMMA_SWEEP = [0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
-THRESHOLD_PCTL = 95        # theta_A operating point
+    # ----- compliance -----
+    noncompliance_rate: float = 0.15
+    deviation_mix: Dict[str, float] = field(default_factory=lambda: {
+        "overtreatment": 0.62, "delayed_auth": 0.28, "contraindicated": 0.10})
+    ae_threshold_pct: float = 95.0   # anomaly threshold percentile on validation
 
-# ---- Rehabilitation (tabular Q-learning) ----
-Q_ALPHA = 0.20
-Q_GAMMA = 0.95
-Q_EPISODES = N_REHAB
-REHAB_SEEDS = [11, 23, 37]  # seeds for mean +/- s.d. of cost reduction
+    # ----- rehabilitation MDP -----
+    n_actions: int = 6
+    rl_episodes_train: int = 12000
+    rl_eval_rollouts: int = 3000
 
-# ---- Federated learning ----
-N_CLIENTS = 100
-FED_ROUNDS = 15
-FEDPROX_MU = 0.01
-DP_CLIP = 1.0
-DP_SIGMA = 1.1             # deployed noise multiplier
-DP_DELTA = 1e-5
-SIGMA_SWEEP = [0.5, 0.8, 1.1, 2.0]   # Fig. 5b privacy-utility sweep
+    # ----- federated -----
+    n_orgs: int = 100
+    fed_rounds: int = 20
+    fedprox_mu: float = 0.01
+    dp_noise_multiplier: float = 1.1
+    dp_clip: float = 1.0
+    dp_delta: float = 1e-5
 
-# ---- Dempster-Shafer frame ----
-DS_FRAME = ["On-Track", "At-Risk", "Critical"]
+    # ----- evaluation -----
+    n_folds: int = 5
+    bootstrap_reps: int = 1000
+    test_frac: float = 0.15
+    val_frac: float = 0.15
 
-# ---- ODG intensity envelope (guideline benchmark) ----
-ODG_ENVELOPE = 1.0
+
+CONFIG = Config()

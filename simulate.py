@@ -1,189 +1,177 @@
-"""Synthetic cohort generation.
+"""Synthetic workers'-compensation cohort generator.
 
-Marginals are calibrated to publicly reported industry statistics (NCCI lost-time
-exhibits; WCRI CompScope duration/attorney/return-to-work metrics). The prognosis
-generator deliberately embeds BOTH a linear risk component (recoverable by a
-Cox model) and nonlinear feature interactions (recoverable only by a tree
-ensemble), which is what produces the reported concordance gap between the
-cause-specific Cox baseline and the gradient-boosted competing-risks model.
+Generates three coupled datasets from an explicit generative model:
+  1. Injury-prognosis cohort  -> cause-specific Weibull competing risks
+  2. Treatment-compliance sequences -> guideline manifold + deviation injection
+  3. Rehabilitation episodes  -> stochastic recovery MDP (built in rehab.py)
+
+Everything is driven by the config seed so the whole study is reproducible.
+The generative parameters are chosen so marginals land near published-style
+benchmarks; fidelity is *checked*, not assumed (see run_all.py / Table 3).
 """
 import numpy as np
-from . import config as C
+import pandas as pd
 
 
-# ----------------------------------------------------------------------
-# Injury prognosis: competing-risks survival cohort
-# ----------------------------------------------------------------------
-def _std(v):
-    v = v - v.mean()
-    s = v.std()
-    return v / (s if s > 0 else 1.0)
+# latent covariates that drive both time-to-event and (later) treatment
+COVARS = [
+    "age", "comorbidity", "severity", "func_capacity", "psychosocial",
+    "attorney", "prior_claims", "bmi", "sector_idx", "jurisdiction",
+]
 
 
-def make_prognosis_cohort(seed=C.MASTER_SEED, n=None):
-    n = n or C.N_PROGNOSIS
-    rng = np.random.default_rng(seed)
+def _sector_draw(rng, cfg, n):
+    idx = rng.choice(len(cfg.sectors), size=n, p=np.array(cfg.sector_weights))
+    return idx
 
-    # informative covariates
-    age = rng.normal(42, 11, n).clip(18, 72)
-    comorbidity = rng.gamma(2.0, 1.0, n)
-    severity = rng.beta(2.0, 5.0, n)                       # 0..1
-    fce = rng.normal(0.55, 0.18, n).clip(0, 1)             # functional capacity
-    adherence = rng.beta(5, 2, n)                          # treatment adherence
-    attorney = (rng.random(n) < 0.206).astype(float)       # ~20.6% (WCRI-calibrated)
-    sector = rng.choice(len(C.SECTORS), n, p=C.SECTOR_WEIGHTS)
-    jur = rng.integers(0, C.N_JURISDICTIONS, n)
-    psychosocial = rng.normal(0, 1, n)
 
-    # LINEAR risk (Cox-recoverable from the informative core)
-    Z = np.column_stack([
-        np.ones(n), (age - 42) / 11, comorbidity - 2, severity - 0.28, fce - 0.55,
-        adherence - 0.71, attorney, psychosocial,
-        np.eye(len(C.SECTORS))[sector][:, 1:],
-    ])
-    beta = np.array([0.0, 0.45, 0.5, 0.95, -0.7, -0.6, 0.5, 0.5] + [0.22] * (Z.shape[1] - 8))
-    eta_lin = _std(Z @ beta)
+def generate_prognosis(cfg):
+    """Return a DataFrame with covariates, observed time, event cause, and
+    a latent 'recovery_trajectory' signal used to build the cross-domain H.
 
-    # NONLINEAR interactions, then residualized against the linear design so a
-    # Cox model provably cannot recover them (only a tree ensemble can).
-    raw_nl = (
-        1.2 * severity * comorbidity
-        - 1.0 * fce * adherence
-        + 1.1 * ((severity > 0.45).astype(float) * attorney)
-        + 1.0 * np.sin(3.2 * psychosocial)
-        + 0.8 * ((comorbidity > 3).astype(float) * (1 - adherence))
-        + 0.7 * np.cos(2.5 * (fce - 0.5) * 6)
+    Causes: 0 full-duty RTW, 1 modified-duty RTW, 2 permanent disability.
+    Censoring: administrative at horizon_weeks.
+    """
+    rng = np.random.default_rng(cfg.seed)
+    n = cfg.n_claims
+
+    age = np.clip(rng.normal(42, 11, n), 18, 70)
+    comorbidity = rng.poisson(0.8, n).astype(float)
+    severity = np.clip(rng.beta(2.0, 3.0, n), 0, 1)            # 0 mild .. 1 severe
+    func_capacity = np.clip(rng.normal(0.65, 0.18, n), 0, 1)   # higher = better
+    psychosocial = np.clip(rng.normal(0.4, 0.2, n), 0, 1)      # higher = more risk
+    attorney = (rng.random(n) < (0.06 + 0.22 * severity + 0.14 * psychosocial)).astype(int)
+    prior_claims = rng.poisson(0.5, n).astype(float)
+    bmi = np.clip(rng.normal(28, 5, n), 16, 50)
+    sector_idx = _sector_draw(rng, cfg, n)
+    jurisdiction = rng.integers(0, cfg.n_jurisdictions, n)
+
+    # sector modifies baseline hazard (non-IID structure for federation)
+    sector_haz = np.array([1.0, 1.05, 0.95, 1.15, 0.9, 0.8, 1.2])[sector_idx]
+
+    # linear predictor raising overall event intensity (shorter durations)
+    lp = (
+        -0.9 * severity - 0.6 * comorbidity / 3 + 0.8 * func_capacity
+        - 0.5 * psychosocial - 0.015 * (age - 40) - 0.4 * attorney
+        - 0.1 * prior_claims - 0.01 * (bmi - 28)
     )
-    coef, *_ = np.linalg.lstsq(Z, raw_nl, rcond=None)
-    eta_nl = _std(raw_nl - Z @ coef)                        # linear-orthogonal residual
+    # cause-specific relative intensities (softmax-like over three outcomes)
+    #   full-duty favoured by good function/low severity; permanent by opposite
+    s_full = 1.1 + 1.0 * func_capacity - 1.2 * severity - 0.8 * psychosocial - 0.5 * attorney
+    s_mod = 0.4 + 0.2 * severity - 0.3 * func_capacity
+    s_perm = -3.2 + 2.0 * severity + 1.0 * psychosocial + 0.9 * attorney + 0.02 * (age - 40)
+    S = np.vstack([s_full, s_mod, s_perm]).T
+    P = np.exp(S - S.max(1, keepdims=True))
+    P = P / P.sum(1, keepdims=True)              # cause probabilities (if event occurs)
 
-    # signal/noise tuned so Cox C-index ~0.624 and gradient boosting ~0.671
-    A_LIN, A_NL, SIGMA = 1.0, 0.9, 1.9
-    latent = A_LIN * eta_lin + A_NL * eta_nl + SIGMA * rng.normal(0, 1, n)
-    lz = _std(latent)
+    # Weibull time-to-event; scale shortened by exp(lp) and sector
+    shape_k = 1.2
+    base_scale = 9.0                              # weeks (most claims close in weeks)
+    scale = base_scale * np.exp(-lp) / sector_haz
+    t_event = scale * rng.weibull(shape_k, n)     # weeks
+    cause = np.array([rng.choice(3, p=P[i]) for i in range(n)])
+    # permanent-disability claims form the long tail
+    t_event = t_event * np.where(cause == 2, 3.0, 1.0)
 
-    cadm = C.CENSOR_WEEKS * 7                                # 728 days
+    # administrative censoring
+    censored = t_event > cfg.horizon_weeks
+    observed_t = np.where(censored, cfg.horizon_weeks, t_event)
+    event = (~censored).astype(int)               # 1 if any event observed
+    obs_cause = np.where(censored, -1, cause)      # -1 = censored
 
-    # Two-population outcome model (resolving vs chronic) reproduces both the
-    # ~67-day median lost-time and the ~38% two-year censoring simultaneously.
-    p_chronic = 1.0 / (1.0 + np.exp(-(1.35 * lz - 0.30)))    # rises with risk
-    chronic = rng.random(n) < p_chronic
+    # latent recovery-trajectory signal (ground truth the models will estimate)
+    recovery = np.clip(
+        0.6 * func_capacity - 0.5 * severity - 0.4 * psychosocial
+        - 0.2 * (comorbidity / 3) + 0.15 * (cause == 0) - 0.2 * (cause == 2)
+        + rng.normal(0, 0.1, n), -1, 1)
+    recovery = (recovery - recovery.min()) / (np.ptp(recovery) + 1e-9)  # -> [0,1]
 
-    duration = np.empty(n, np.float64)
-    cause = np.full(n, -1, np.int64)                        # -1 = censored/open
-
-    # resolving claims: return full- or modified-duty, time rises with latent
-    res = ~chronic
-    nres = int(res.sum())
-    base = np.exp(4.68 + 0.65 * lz[res]) * (-np.log(rng.random(nres))) ** (1 / 1.6)
-    dur_res = np.clip(base, 3, cadm - 1)
-    # modified-duty more likely for higher-latent resolvers
-    p_mod = 1.0 / (1.0 + np.exp(-(0.9 * lz[res] + 0.85)))
-    is_mod = rng.random(nres) < p_mod
-    cres = np.where(is_mod, 1, 0)
-    duration[res] = dur_res
-    cause[res] = cres
-
-    # chronic claims: a minority reach a permanent-disability determination
-    # (observed, late); the rest remain open at two years (censored).
-    nchr = int(chronic.sum())
-    is_pd = rng.random(nchr) < 0.135
-    dur_chr = np.where(is_pd,
-                       rng.uniform(240, cadm - 1, nchr),     # PD determination
-                       cadm)                                  # still open -> censored
-    cchr = np.where(is_pd, 2, -1)
-    duration[chronic] = dur_chr
-    cause[chronic] = cchr
-
-    observed = (cause >= 0).astype(int)
-
-    # engineered 112-feature vector: informative core + weak echoes + noise
-    core = np.column_stack([age, comorbidity, severity, fce, adherence,
-                            attorney, psychosocial, sector, jur])
-    extra = rng.normal(0, 1, (n, C.N_FEATURES - core.shape[1])).astype(np.float32)
-    extra[:, 0] += 0.7 * eta_nl
-    extra[:, 1] += 0.5 * severity * comorbidity
-    extra[:, 2] += 0.5 * (severity > 0.45) * attorney
-    X = np.column_stack([core, extra]).astype(np.float32)
-
-    return dict(X=X, duration=duration.astype(np.float32),
-                observed=observed, cause=cause,
-                primary_event=((cause == 0)).astype(int),  # full-duty RTW = event of interest
-                attorney=attorney, severity=severity, psychosocial=psychosocial,
-                latent=latent)
+    df = pd.DataFrame({
+        "age": age, "comorbidity": comorbidity, "severity": severity,
+        "func_capacity": func_capacity, "psychosocial": psychosocial,
+        "attorney": attorney, "prior_claims": prior_claims, "bmi": bmi,
+        "sector_idx": sector_idx, "jurisdiction": jurisdiction,
+        "time": observed_t, "event": event, "cause": obs_cause,
+        "true_cause": cause, "recovery_latent": recovery,
+    })
+    return df
 
 
-# ----------------------------------------------------------------------
-# Treatment compliance: labelled clinical sequences
-# ----------------------------------------------------------------------
-def make_compliance_cohort(seed=C.MASTER_SEED + 1, n=None, frac_bad=None):
-    n = n or C.N_COMPLIANCE
-    frac_bad = C.FRAC_NONCOMPLIANT if frac_bad is None else frac_bad
-    rng = np.random.default_rng(seed)
-    T, D = C.SEQ_LEN, C.SEQ_DIM
-
-    n_bad = int(round(n * frac_bad))
-    n_good = n - n_bad
-    labels = np.r_[np.zeros(n_good, int), np.ones(n_bad, int)]
-
-    # guideline-consistent manifold: smooth low-amplitude multivariate series
-    def base_series(m):
-        t = np.linspace(0, 1, T)
-        phase = rng.uniform(0, 2 * np.pi, (m, D))
-        amp = rng.uniform(0.2, 0.5, (m, D))
-        freq = rng.uniform(1.0, 2.0, (m, D))
-        s = amp[:, None, :] * np.sin(2 * np.pi * freq[:, None, :] * t[None, :, None]
-                                     + phase[:, None, :])
-        s += rng.normal(0, 0.10, (m, T, D))         # manifold noise (limits separability)
-        # intensity channel (col 0) reflects treatment intensity vs ODG envelope
-        s[:, :, 0] += 0.5
-        return s
-
-    good = base_series(n_good)
-
-    # subtle deviations injected into otherwise-consistent trajectories; magnitudes
-    # are calibrated so the detector is strong but not saturated (ROC-AUC ~0.95).
-    bad = base_series(n_bad)
-    mix = C.DEVIATION_MIX
-    kinds = rng.choice(list(mix), n_bad, p=list(mix.values()))
-    for i in range(n_bad):
-        start = rng.integers(4, T - 6)
-        if kinds[i] == "overtreatment":            # intensity exceeds ODG envelope
-            bad[i, start:, 0] += rng.uniform(0.62, 1.05)
-            bad[i, start:, 3:6] += rng.uniform(0.28, 0.55)
-        elif kinds[i] == "delayed_auth":           # a gap then a modest spike
-            bad[i, start:start + 4, :] *= 0.38
-            bad[i, start + 4:, 0] += rng.uniform(0.45, 0.75)
-        else:                                       # contraindicated procedure ordering
-            bad[i, start, 6:10] += rng.uniform(1.0, 1.7)
-
-    X = np.concatenate([good, bad], axis=0).astype(np.float32)
-    # ODG intensity benchmark per condition (used by the guideline regularizer)
-    odg_envelope = 1.0
-    idx = rng.permutation(n)
-    return dict(X=X[idx], y=labels[idx], odg=odg_envelope, kinds=None)
+def rolling_features(df):
+    """XGBoost feature-engineering layer: expand covariates with interactions
+    and rolling-style aggregates that a claims pipeline would compute.
+    Returns an (n, p) float matrix and the feature names.
+    """
+    x = df[COVARS].to_numpy(float).copy()
+    feats = list(COVARS)
+    extra, names = [], []
+    # interaction / nonlinear expansions (stand in for 14/30/90-day windows)
+    def add(col, name):
+        extra.append(col); names.append(name)
+    add(df["severity"] * df["comorbidity"], "sev_x_comorb")
+    add(df["severity"] * (1 - df["func_capacity"]), "sev_x_lowfunc")
+    add(df["psychosocial"] * df["attorney"], "psych_x_atty")
+    add(df["age"] * df["severity"] / 40, "age_x_sev")
+    add(np.log1p(df["prior_claims"]), "log_prior")
+    add((df["bmi"] > 30).astype(float), "obese")
+    add(df["func_capacity"] ** 2, "func_sq")
+    add(df["severity"] ** 2, "sev_sq")
+    X = np.column_stack([x] + extra)
+    return X, feats + names
 
 
-# ----------------------------------------------------------------------
-# Rehabilitation: MDP episodes for tabular Q-learning
-# ----------------------------------------------------------------------
-def make_rehab_cohort(seed=C.MASTER_SEED + 2, n=None):
-    n = n or C.N_REHAB
-    rng = np.random.default_rng(seed)
-    # discretized recovery-index state (H bucket) x severity bucket
-    H0 = rng.beta(2.5, 2.5, n)              # initial recovery-trajectory index
-    sev = rng.beta(2, 5, n)
-    return dict(H0=H0.astype(np.float32), sev=sev.astype(np.float32), rng_seed=seed)
+def generate_compliance(cfg):
+    """Weekly treatment-intensity sequences with injected guideline deviations.
+
+    Returns X (n, seq_len, n_channels), y (0 compliant / 1 non-compliant),
+    dev_type array, and the ODG intensity envelope per step.
+    """
+    rng = np.random.default_rng(cfg.seed + 1)
+    n, T = cfg.n_compliance, cfg.seq_len
+    channels = 4  # treatment intensity, visits, meds, procedure-risk
+
+    # ODG-style guideline envelope: intensity should decay over an episode
+    envelope = 1.0 - 0.6 * (np.arange(T) / T)          # (T,)
+
+    X = np.zeros((n, T, channels))
+    y = np.zeros(n, int)
+    dev_type = np.array(["compliant"] * n, dtype=object)
+
+    n_bad = int(round(cfg.noncompliance_rate * n))
+    bad_idx = rng.choice(n, size=n_bad, replace=False)
+    is_bad = np.zeros(n, bool); is_bad[bad_idx] = True
+    mix = cfg.deviation_mix
+    dev_labels = rng.choice(list(mix.keys()), size=n, p=np.array(list(mix.values())))
+
+    for i in range(n):
+        base = envelope * rng.uniform(0.7, 1.0) + rng.normal(0, 0.05, T)
+        visits = np.clip(base * rng.uniform(0.8, 1.2, T), 0, None)
+        meds = np.clip(envelope * rng.uniform(0.6, 1.0) + rng.normal(0, 0.06, T), 0, None)
+        proc_risk = np.clip(rng.normal(0.15, 0.05, T), 0, 1)
+        intensity = np.clip(base, 0, None)
+
+        if is_bad[i]:
+            d = dev_labels[i]; dev_type[i] = d; y[i] = 1
+            start = rng.integers(0, T - 4)
+            if d == "overtreatment":
+                intensity[start:] += rng.uniform(0.12, 0.30)    # mildly exceeds envelope
+                visits[start:] += rng.uniform(0.10, 0.25)
+            elif d == "delayed_auth":
+                intensity[:start + 3] *= rng.uniform(0.45, 0.65)  # suppressed early care
+                visits[:start + 3] *= rng.uniform(0.5, 0.7)
+            else:  # contraindicated
+                proc_risk[start:start + 3] += rng.uniform(0.20, 0.40)
+        X[i] = np.column_stack([intensity, visits, meds, proc_risk])
+
+    return X, y, dev_type, envelope
 
 
-# calibration table used by tests / README
-def cohort_marginals(pro):
-    dur_days = pro["duration"]
-    lt = dur_days[pro["observed"] == 1]
-    return dict(
-        median_lost_time_days=float(np.median(lt)),
-        pd_incidence_pct=float(100 * (pro["cause"] == 2).mean()),
-        attorney_rate_pct=float(100 * pro["attorney"].mean()),
-        modified_duty_share_pct=float(100 * (pro["cause"] == 1).mean()),
-        censored_pct=float(100 * (pro["observed"] == 0).mean()),
-    )
+if __name__ == "__main__":
+    from .config import CONFIG
+    df = generate_prognosis(CONFIG)
+    print("prognosis:", df.shape)
+    print(df[["time", "event", "cause"]].describe().round(2).to_string())
+    print("event rate:", df.event.mean().round(3),
+          "| perm-disability share:", (df.true_cause == 2).mean().round(3))
+    Xc, yc, dt, env = generate_compliance(CONFIG)
+    print("compliance:", Xc.shape, "non-compliant:", yc.mean().round(3))

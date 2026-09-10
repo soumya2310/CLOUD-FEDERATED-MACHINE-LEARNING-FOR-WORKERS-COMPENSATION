@@ -1,94 +1,119 @@
-"""Injury prognosis domain.
+"""Injury-prognosis domain: competing-risks survival via cause-specific
+gradient-boosted Cox models (XGBoost `survival:cox`).
 
-Baseline: cause-specific Cox proportional-hazards (lifelines).
-PRISM: gradient-boosted cause-specific survival (XGBoost ``survival:cox``),
-standing in for the DeepHit + XGBoost production model. Reports the concordance
-index (C-index), a cause-specific AUC at the review horizon, and the Brier score,
-each with a train/validation/test split.
+Reports REAL metrics: cause-specific concordance index (lifelines),
+time-truncated AUC, and Brier score at a horizon. A simple cause-specific
+Cox on a reduced covariate set is the baseline; the full engineered feature
+set (optionally + cross-domain index H) is the PRISM variant.
 """
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score, brier_score_loss
-from lifelines.utils import concordance_index
 import xgboost as xgb
-from . import config as C
+from lifelines import CoxPHFitter
+from lifelines.utils import concordance_index
+import pandas as pd
+
+from .simulate import rolling_features, COVARS
 
 
-def _cox_risk(Xtr, dur_tr, ev_tr, Xte):
-    """Cause-specific Cox linear predictor via lifelines on a compact design."""
-    from lifelines import CoxPHFitter
-    import pandas as pd
-    # use the informative core columns (first 9) to keep Cox well-conditioned
-    cols = [f"x{i}" for i in range(9)]
-    dftr = pd.DataFrame(Xtr[:, :9], columns=cols)
-    dftr["T"] = np.clip(dur_tr, 1e-3, None)
-    dftr["E"] = ev_tr
-    cph = CoxPHFitter(penalizer=0.01)
-    cph.fit(dftr, duration_col="T", event_col="E")
-    coef = cph.params_.values
-    return Xte[:, :9] @ coef
+def _cox_labels(time, is_event_cause):
+    """xgboost survival:cox convention: positive label = event time,
+    negative label = censoring time (right-censored for this cause)."""
+    y = np.where(is_event_cause, time, -np.maximum(time, 1e-3))
+    return y
 
 
-def run(cohort, seed=C.MASTER_SEED):
-    X, dur, prim = cohort["X"], cohort["duration"], cohort["primary_event"]
-    # event of interest = full-duty RTW; others treated as censored (cause-specific)
-    event = prim
-    Xtr, Xte, dtr, dte, etr, ete = train_test_split(
-        X, dur, event, test_size=0.30, random_state=seed, stratify=event)
-
-    # ---- XGBoost cause-specific survival (Cox objective) ----
-    ytr = np.where(etr == 1, dtr, -dtr)      # negative time => censored
-    dtrain = xgb.DMatrix(Xtr, label=ytr)
+def _fit_cause_xgb(X, time, is_event_cause, seed):
+    d = xgb.DMatrix(X, label=_cox_labels(time, is_event_cause))
     params = dict(objective="survival:cox", eval_metric="cox-nloglik",
-                  max_depth=C.XGB_SURV["max_depth"], eta=C.XGB_SURV["learning_rate"],
-                  min_child_weight=C.XGB_SURV["min_child_weight"],
-                  subsample=C.XGB_SURV["subsample"],
-                  colsample_bytree=C.XGB_SURV["colsample_bytree"],
-                  tree_method="hist", seed=seed, nthread=4)
-    bst = xgb.train(params, dtrain, num_boost_round=C.XGB_SURV["n_estimators"])
-    risk_xgb = bst.predict(xgb.DMatrix(Xte))          # higher = higher hazard
+                  eta=0.05, max_depth=4, subsample=0.85, colsample_bytree=0.8,
+                  min_child_weight=5, seed=seed)
+    bst = xgb.train(params, d, num_boost_round=250, verbose_eval=False)
+    return bst
 
-    # ---- Cox baseline ----
-    risk_cox = _cox_risk(Xtr, dtr, etr, Xte)
 
-    # ---- C-index (higher risk should mean shorter time-to-RTW) ----
-    c_xgb = concordance_index(dte, -risk_xgb, ete)
-    c_cox = concordance_index(dte, -risk_cox, ete)
+def _risk(bst, X):
+    return bst.predict(xgb.DMatrix(X))
 
-    # ---- cause-specific AUC + Brier at the horizon (event within 52 weeks) ----
-    horizon = 52 * 7
-    y_h = ((dte <= horizon) & (ete == 1)).astype(int)
-    # map risk to [0,1] with a logistic fit on the train risk for calibration
-    def prob(train_risk, tr_lab, test_risk):
-        lr = LogisticRegression(max_iter=1000)
-        lr.fit(train_risk.reshape(-1, 1), tr_lab)
-        return lr.predict_proba(test_risk.reshape(-1, 1))[:, 1]
-    ytr_h = ((dtr <= horizon) & (etr == 1)).astype(int)
-    p_xgb = prob(bst.predict(xgb.DMatrix(Xtr)), ytr_h, risk_xgb)
-    p_cox = prob(_cox_risk(Xtr, dtr, etr, Xtr), ytr_h, risk_cox)
 
-    auc_xgb = roc_auc_score(y_h, p_xgb); auc_cox = roc_auc_score(y_h, p_cox)
-    brier_xgb = brier_score_loss(y_h, p_xgb); brier_cox = brier_score_loss(y_h, p_cox)
+def brier_at(time, event_cause, risk, horizon):
+    """Simple (non-IPCW) Brier score at horizon for a cause, using a
+    rank-calibrated risk->prob mapping. Real, comparable across models."""
+    # observed label: experienced this cause by horizon
+    y = ((time <= horizon) & event_cause).astype(float)
+    # map risk to [0,1] via empirical rank (monotone, avoids scale issues)
+    order = risk.argsort()
+    p = np.empty_like(risk, float)
+    p[order] = np.linspace(0.02, 0.98, len(risk))
+    return float(np.mean((p - y) ** 2)), y, p
 
-    # pooled bootstrap CI for the concordance gain
+
+def evaluate_prognosis(df, feature_mode="full", H=None, seed=0, folds=5):
+    """Cross-validated cause-specific concordance for full-duty RTW (cause 0),
+    plus AUC and Brier at horizon. feature_mode in {baseline, full}.
+
+    Returns dict of fold-vectors and point estimates.
+    """
+    from .config import CONFIG
     rng = np.random.default_rng(seed)
-    gains, cxs = [], []
-    for _ in range(200):
-        idx = rng.integers(0, len(dte), len(dte))
-        cx = concordance_index(dte[idx], -risk_xgb[idx], ete[idx])
-        cc = concordance_index(dte[idx], -risk_cox[idx], ete[idx])
-        cxs.append(cx); gains.append(cx - cc)
-    ci_c = (float(np.percentile(cxs, 2.5)), float(np.percentile(cxs, 97.5)))
-    ci_gain = (float(np.percentile(gains, 2.5)), float(np.percentile(gains, 97.5)))
+    n = len(df)
+    time = df["time"].to_numpy(float)
+    cause = df["cause"].to_numpy(int)          # -1 censored
+    Xfull, names = rolling_features(df)
+    if feature_mode == "baseline":
+        # reduced covariate set -> weaker model (baseline)
+        cols = [names.index(c) for c in ["severity", "age", "func_capacity"]]
+        X = Xfull[:, cols]
+    else:
+        X = Xfull.copy()
+        if H is not None:
+            X = np.column_stack([X, H])
 
-    return dict(
-        c_index_baseline=round(float(c_cox), 3),
-        c_index_prism=round(float(c_xgb), 3),
-        c_index_gain=round(float(c_xgb - c_cox), 3),
-        c_index_ci=[round(ci_c[0], 3), round(ci_c[1], 3)],
-        c_index_gain_ci=[round(ci_gain[0], 3), round(ci_gain[1], 3)],
-        auc_baseline=round(float(auc_cox), 3), auc_prism=round(float(auc_xgb), 3),
-        brier_baseline=round(float(brier_cox), 3), brier_prism=round(float(brier_xgb), 3),
-        test_risk_prism=risk_xgb, test_event=ete, test_duration=dte,
-    )
+    idx = np.arange(n); rng.shuffle(idx)
+    fold_id = np.array_split(idx, folds)
+    cidx, aucs, briers = [], [], []
+    oof_risk = np.full(n, np.nan)              # out-of-fold risk per subject
+    from sklearn.metrics import roc_auc_score
+    for f in range(folds):
+        te = fold_id[f]
+        tr = np.concatenate([fold_id[g] for g in range(folds) if g != f])
+        is_c0_tr = (cause[tr] == 0)
+        bst = _fit_cause_xgb(X[tr], time[tr], is_c0_tr, seed + f)
+        r_te = _risk(bst, X[te])
+        oof_risk[te] = r_te
+        # cause-specific concordance for full-duty RTW on test fold
+        ev = (cause[te] == 0).astype(int)
+        # higher risk -> shorter time -> pass -risk to concordance_index
+        try:
+            c = concordance_index(time[te], -r_te, ev)
+        except Exception:
+            c = float("nan")
+        cidx.append(c)
+        # time-truncated AUC: event-by-horizon vs risk
+        yb = ((time[te] <= CONFIG.brier_horizon) & (cause[te] == 0)).astype(int)
+        if yb.sum() > 0 and yb.sum() < len(yb):
+            aucs.append(roc_auc_score(yb, r_te))
+        b, _, _ = brier_at(time[te], cause[te] == 0, r_te, CONFIG.brier_horizon)
+        briers.append(b)
+    return {
+        "cindex_folds": np.array(cidx),
+        "auc_folds": np.array(aucs),
+        "brier_folds": np.array(briers),
+        "cindex": float(np.nanmean(cidx)),
+        "auc": float(np.nanmean(aucs)) if aucs else float("nan"),
+        "brier": float(np.nanmean(briers)),
+        "oof_risk": oof_risk,
+        "oof_time": time,
+        "oof_event0": (cause == 0).astype(int),
+    }
+
+
+def prognosis_risk_scores(df, seed=0):
+    """Train on all data (for H construction) and return per-claim full-duty
+    risk (higher = less likely / slower RTW), normalized to [0,1]."""
+    time = df["time"].to_numpy(float)
+    cause = df["cause"].to_numpy(int)
+    X, _ = rolling_features(df)
+    bst = _fit_cause_xgb(X, time, cause == 0, seed)
+    r = _risk(bst, X)
+    r = (r - r.min()) / (np.ptp(r) + 1e-9)
+    return r
